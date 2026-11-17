@@ -142,6 +142,18 @@ static void far_el1_write(CPUARMState *env, const ARMCPRegInfo *ri,
     }
 }
 
+/*
+ * XNU rewrites SPRR_EL1BR0_EL1 on context switch (TPRO mirror);
+ * EL1 translations of user addresses cached with the old permissions must go.
+ */
+static void sprr_el1br0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                              uint64_t value)
+{
+    raw_write(env, ri, value);
+    tlb_flush_by_mmuidx(env_cpu(env),
+                        ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN);
+}
+
 static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                 uint64_t value)
 {
@@ -554,6 +566,9 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .opc2 = 7,
         .access = PL1_RW,
         .resetvalue = 0,
+        .readfn = raw_read,
+        .writefn = sprr_el1br0_write,
+        .raw_writefn = raw_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[1][0]),
     },
     {
