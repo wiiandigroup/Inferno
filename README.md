@@ -2,6 +2,27 @@
 
 ChefKiss Inferno is derivative of the QEMU project which provides Apple ARM device guest support.
 
+## About this fork
+
+This is an unofficial fork of ChefKiss Inferno (upstream archived on 2026-11-01), not affiliated with or endorsed by
+the ChefKiss project. It is used to run iOS on the emulated iPhone 11 (`t8030`) for development and testing. The
+upstream badge above describes upstream's code; the changes listed below were written with AI assistance (Claude),
+as their `Co-Authored-By` lines show.
+
+### Changes in this fork
+
+| Change | Why |
+|---|---|
+| `target/arm`: EL1 accesses to TTBR0 (user) addresses use `SPRR_EL1BR0_EL1` | Every EL1 access used `SPRR_EL1BR1_EL1`. On iOS 26 this broke kernel copies into dyld's TPRO-protected memory, so the restore engine died at boot and never waited for a host. |
+| `a13_gxf`: flush EL1 and guarded-mode (GXF) TLB entries when `SPRR_EL1BR0_EL1` is written | XNU rewrites the register on every context switch; cached translations kept the old permissions. |
+| A13: the rest of the PMU registers (PMC2 and up, PMESR, OPMAT, OPMSK) as plain storage | iOS 26 saves and restores them; the missing registers stopped its kernel at boot. |
+| Display pipe: raise `OUTPUT_READY` from a 60 Hz vblank timer | It was only raised when a display client redrew, so with VNC and no viewer connected iOS waited for a frame forever (a restore stalled after the upload). |
+| Build without `ENABLE_DATA_ENCRYPTION` | Lets the machine start with a simulated SEP, without a dumped SEP ROM. This turns iOS data protection off in every configuration, also with real SEP emulation. |
+| Touch controller (`mt-spi`): 30-byte path record (contact density, pitch, force, flags), edge flag, velocity in units per second clamped to INT16_MAX, 60 Hz reports, reports sent in order | The old 20-byte record and zero velocity were not enough for iOS to treat a drag as a gesture; queued reports could reach iOS in reverse order. Layout follows [MakrSas/Inferno](https://github.com/MakrSas/Inferno). Taps reach iOS 14; swipe to unlock is still being worked on. |
+
+Tested with iOS 14.0 beta 5 (`18A5351d`): restore with real SEP emulation, first boot and USB pairing work. iOS 26.6.2
+(`23G90`) restore is in progress. iOS 27 does not boot: it needs SPTM and TXM, which Inferno does not emulate.
+
 > [!CAUTION]
 > Please consider donating/tipping to help continue the project's development,
 > keeping it free and open-source.
