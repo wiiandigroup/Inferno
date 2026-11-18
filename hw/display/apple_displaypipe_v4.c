@@ -177,6 +177,7 @@ struct AppleDisplayPipeV4State {
     QemuConsole *console;
     QEMUBH *update_disp_image_bh;
     QEMUTimer *boot_splash_timer;
+    QEMUTimer *vblank_timer;
 };
 
 static const VMStateDescription vmstate_adp_v4 = {
@@ -676,6 +677,26 @@ static void adp_v4_gfx_update(void *opaque)
     adp_v4_update_irqs(adp);
 }
 
+/*
+ * Real display hardware signals OUTPUT_READY on every vertical blank, whether or
+ * not anything watches the panel. Raising it only from gfx_update ties it to a UI
+ * listener: with -display none, or -vnc and no client connected, QEMU never calls
+ * gfx_update, iOS's display driver waits for the interrupt forever, and whatever
+ * draws (the restore progress bar in ramrod) blocks the restore. Tick at 60 Hz on
+ * the guest's virtual clock instead.
+ */
+#define ADP_V4_VBLANK_NS (NANOSECONDS_PER_SECOND / 60)
+
+static void adp_v4_vblank(void *opaque)
+{
+    AppleDisplayPipeV4State *adp = opaque;
+
+    qatomic_or(&adp->int_status, R_CONTROL_INT_OUTPUT_READY_MASK);
+    adp_v4_update_irqs(adp);
+    timer_mod(adp->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_NS);
+}
+
 static const GraphicHwOps adp_v4_ops = {
     .invalidate = adp_v4_invalidate,
     .gfx_update = adp_v4_gfx_update,
@@ -847,6 +868,9 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
     adp_v4_blend_reset(&adp->blend_unit);
 
     adp_v4_read_and_draw_boot_splash(adp);
+
+    timer_mod(adp->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_NS);
 }
 
 static void adp_v4_realize(DeviceState *dev, Error **errp)
@@ -854,6 +878,7 @@ static void adp_v4_realize(DeviceState *dev, Error **errp)
     AppleDisplayPipeV4State *adp = APPLE_DISPLAY_PIPE_V4(dev);
 
     adp->console = graphic_console_init(dev, 0, &adp_v4_ops, adp);
+    adp->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adp_v4_vblank, adp);
 }
 
 static const Property adp_v4_props[] = {

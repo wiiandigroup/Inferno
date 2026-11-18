@@ -1012,9 +1012,11 @@ static int simple_ap_to_rw_prot(CPUARMState *env, ARMMMUIdx mmu_idx, int ap)
  * @xn:      XN (execute-never) bits
  * @pxn:     PXN (privileged-execute-never) bits
  * @guarded: TRUE if accessing from GXF
+ * @select:  translation table half of the address (0 = TTBR0/user, 1 = TTBR1/kernel)
  */
 static inline int
-pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guarded)
+pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guarded,
+                            int select)
 {
     int el;
     int sprr_idx;
@@ -1030,7 +1032,13 @@ pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guar
     assert(el < 2);
 
     sprr_idx = ((ap << 2) | (xn << 1) | pxn) & 0xf;
-    sprr_perm = env->sprr.sprr_el_br_el1[el][el];
+    /*
+     * EL1 accesses to the TTBR0 (user) half are governed by
+     * SPRR_EL1BR0_EL1, not SPRR_EL1BR1_EL1. XNU mirrors a thread's TPRO state into
+     * EL1BR0 on every context switch, so copyout to dyld's TPRO pages only works
+     * when EL1 user-half accesses use it (iOS 26 dyld asserted on KERN_MEMORY_ERROR).
+     */
+    sprr_perm = env->sprr.sprr_el_br_el1[el][el == 0 ? 0 : (select ? 1 : 0)];
 
     attr = SPRR_EXTRACT_IDX_ATTR(sprr_perm, sprr_idx);
     prot = 0;
@@ -1091,9 +1099,10 @@ pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guar
  * @pxn:     PXN (privileged-execute-never) bits
  */
 static inline int
-pte_to_sprr_prot(CPUARMState *env, int ap, int xn, int pxn)
+pte_to_sprr_prot(CPUARMState *env, int ap, int xn, int pxn, int select)
 {
-    return pte_to_sprr_prot_is_guarded(env, ap, xn, pxn, arm_is_guarded(env));
+    return pte_to_sprr_prot_is_guarded(env, ap, xn, pxn, arm_is_guarded(env),
+                                       select);
 }
 
 static bool get_phys_addr_v5(CPUARMState *env, S1Translate *ptw,
@@ -1360,8 +1369,8 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
 #if 0
         // does 32-bit AP have that functionality?
         if (arm_is_sprr_enabled(env)) {
-            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn) & (PAGE_READ | PAGE_WRITE);
-            pxn = !(pte_to_sprr_prot(env, ap, xn, pxn) & PAGE_EXEC);
+            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn, 0) & (PAGE_READ | PAGE_WRITE);
+            pxn = !(pte_to_sprr_prot(env, ap, xn, pxn, 0) & PAGE_EXEC);
         }
 #endif
 
@@ -2217,8 +2226,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
 
         user_rw = simple_ap_to_rw_prot_is_user(ap, true);
         if (arm_is_sprr_enabled(env)) {
-            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn) & (PAGE_READ | PAGE_WRITE);
-            xn = pxn = !(pte_to_sprr_prot(env, ap, xn, pxn) & PAGE_EXEC);
+            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn, param.select) &
+                      (PAGE_READ | PAGE_WRITE);
+            xn = pxn = !(pte_to_sprr_prot(env, ap, xn, pxn, param.select) &
+                         PAGE_EXEC);
         } else {
             prot_rw = simple_ap_to_rw_prot_is_user(ap, false);
         }
@@ -2234,7 +2245,8 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
             if (arm_is_sprr_enabled(env) && !arm_is_guarded(env)) {
                 if (!(result->f.prot & (1 << access_type))) {
                     int gl_prot = pte_to_sprr_prot_is_guarded(env, ap, xn,
-                                                                 pxn, true);
+                                                                 pxn, true,
+                                                                 param.select);
                     if (gl_prot & (1 << access_type)) {
                         fi->type = ARMFault_GXF_Abort;
                         goto do_fault;
