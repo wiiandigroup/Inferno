@@ -21,7 +21,7 @@
 #define HW_ARM_APPLE_SILICON_BOOT_H
 
 // #define ENABLE_BASEBAND
-#define ENABLE_DATA_ENCRYPTION
+// #define ENABLE_DATA_ENCRYPTION
 
 #include "qemu/osdep.h"
 #include "exec/hwaddr.h"
