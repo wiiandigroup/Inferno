@@ -151,7 +151,8 @@ static void sprr_el1br0_write(CPUARMState *env, const ARMCPRegInfo *ri,
 {
     raw_write(env, ri, value);
     tlb_flush_by_mmuidx(env_cpu(env),
-                        ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN);
+                        ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN |
+                        ARMMMUIdxBit_GE10_1 | ARMMMUIdxBit_GE10_1_PAN);
 }
 
 static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
