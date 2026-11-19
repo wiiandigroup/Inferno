@@ -989,7 +989,104 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         g_free(resp_buf);
         break;
     }
+    case 0x51: {
+        /*
+         * iOS 26 AKSIdentitySetPrimary (restore, create_protected_filesystems).
+         * The kext wraps the reply's output blob in an OSData and copies it to
+         * the caller, so an empty output fails with 0xe00002bc. Reply: status
+         * 0, blob length 2, blob = empty DER set (31 00); same layout as
+         * Copy Keybag (status, length, bytes).
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // Identity Set Primary\n");
+
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        uint32_t *selector = (uint32_t *)(resp_hdr + 1);
+        *selector = 0;
+        uint32_t *blob_len = selector + 1;
+        *blob_len = 2;
+        uint8_t *blob = (uint8_t *)(blob_len + 1);
+        blob[0] = 0x31;
+        blob[1] = 0x00;
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
+    case 0x0B: {
+        /*
+         * iOS 26: 0x0B creates the effaceable D key. Reply with the status
+         * word only, like the other no-output requests (Unload Keybag,
+         * Null D Key).
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // 0x%02X (status-only reply)\n", msg_code);
+
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
     default: {
+        /*
+         * Answer with a reply header built like the known requests' replies
+         * (version 1, no flags, request time/id/uid/session/digest copied),
+         * followed by the request body with its first word, the status, set
+         * to 0 (success). A plain echo hands the request's own header and
+         * first word back, so iOS 26's AKSIdentitySetPrimary (restore,
+         * create_protected_filesystems) failed: "ipc digest failed",
+         * 0xe00002bc.
+         */
+        if (msg->size >= KEYSTORE_IPC_HEADER_SIZE + 4) {
+            uint8_t *resp_buf = g_new0(uint8_t, msg->size);
+            KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+            uint32_t *status = (uint32_t *)(resp_hdr + 1);
+
+            memcpy(status, msg_buf + KEYSTORE_IPC_HEADER_SIZE,
+                   msg->size - KEYSTORE_IPC_HEADER_SIZE);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SEP KeyStore // Unknown (0x%02X) size 0x%X"
+                          " version %u flags 0x%X word0 0x%X -> status 0\n",
+                          msg_code, msg->size, msg_hdr->ipc_version,
+                          msg_hdr->flags, *status);
+            resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+            resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+            resp_hdr->time_msecs = msg_hdr->time_msecs;
+            resp_hdr->id = msg_hdr->id;
+            resp_hdr->proc_uid = msg_hdr->proc_uid;
+            resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+            memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+                   sizeof(resp_hdr->ipc_digest));
+            *status = 0;
+
+            apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, msg->size);
+            g_free(resp_buf);
+            break;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Unknown (0x%02X)\n",
                       msg_code);
 
