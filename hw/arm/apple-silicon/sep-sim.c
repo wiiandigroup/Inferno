@@ -138,6 +138,10 @@ enum {
     CONTROL_OP_ERASE_INSTALL = 37,
     CONTROL_OP_L4_PANIC = 38,
     CONTROL_OP_SEP_OS_PANIC = 39,
+    // iOS 26 AppleSEPManager: GET_ENTROPY_FOR_XNU_PRNG. The reply's param is the status (0 = OK) and its data
+    // word is the entropy; without a reply the kernel panics "Failed to get response from SEP when getting
+    // entropy" at its next PRNG reseed.
+    CONTROL_OP_GET_ENTROPY_FOR_XNU_PRNG = 54,
 };
 
 enum {
@@ -388,6 +392,15 @@ static void apple_sep_sim_handle_control_msg(AppleSEPSimState *s,
         qemu_log_mask(LOG_GUEST_ERROR, "EP_CONTROL: SELF_TEST\n");
         apple_sep_sim_control_send_ack(s, msg, 0, 0);
         break;
+    case CONTROL_OP_GET_ENTROPY_FOR_XNU_PRNG: {
+        uint32_t entropy;
+
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "EP_CONTROL: GET_ENTROPY_FOR_XNU_PRNG\n");
+        qemu_guest_getrandom_nofail(&entropy, sizeof(entropy));
+        apple_sep_sim_control_send_ack(s, msg, 0, entropy);
+        break;
+    }
     case CONTROL_OP_ERASE_INSTALL: {
         qemu_log_mask(LOG_GUEST_ERROR, "EP_CONTROL: ERASE_INSTALL\n");
         apple_sep_sim_control_send_ack(s, msg, 0, 0);
