@@ -278,6 +278,30 @@ static void ck_kp_apfs_patches(CKPatcherRange *range)
     ck_patcher_find_callback(range, "bypass root hash authentication",
                              root_hash_pattern, NULL, sizeof(root_hash_pattern),
                              sizeof(uint32_t), ck_kp_root_hash_callback);
+
+    /*
+     * iOS 26 APFS panics "unencrypted data volume is not allowed" when it
+     * mounts a volume whose role is Data (0x40) with its unencrypted flag set.
+     * Without ENABLE_DATA_ENCRYPTION the device tree has no "encryptable"
+     * property, so restore creates the Data volume unencrypted; iOS 14 mounted
+     * it, iOS 26 does not. Skip the panic branch (the tbnz on the flag).
+     */
+    static const uint8_t data_vol_pattern[] = {
+        0x1F, 0x00, 0x01, 0x71, // cmp w?, #0x40
+        0x61, 0x00, 0x00, 0x54, // b.ne +0xc
+        0x00, 0x20, 0x44, 0x39, // ldrb w?, [x?, #0x108]
+        0x00, 0x00, 0x00, 0x37, // tbnz w?, #0, ?
+    };
+    static const uint8_t data_vol_mask[] = {
+        0x1F, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0xFC, 0xFF, 0xFF, 0x00, 0x00, 0xF8, 0xFF,
+    };
+    QEMU_BUILD_BUG_ON(sizeof(data_vol_pattern) != sizeof(data_vol_mask));
+    static const uint8_t data_vol_repl[] = { NOP_BYTES };
+    ck_patcher_find_replace(range, "allow unencrypted data volume",
+                            data_vol_pattern, data_vol_mask,
+                            sizeof(data_vol_pattern), sizeof(uint32_t),
+                            data_vol_repl, NULL, 12, sizeof(data_vol_repl));
 }
 
 static bool ck_kp_tc_callback(void *ctx, uint8_t *buffer)

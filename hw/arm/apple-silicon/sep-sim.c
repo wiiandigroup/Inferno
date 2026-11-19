@@ -138,6 +138,10 @@ enum {
     CONTROL_OP_ERASE_INSTALL = 37,
     CONTROL_OP_L4_PANIC = 38,
     CONTROL_OP_SEP_OS_PANIC = 39,
+    // iOS 26 AppleSEPManager: GET_ENTROPY_FOR_XNU_PRNG. The reply's param is the status (0 = OK) and its data
+    // word is the entropy; without a reply the kernel panics "Failed to get response from SEP when getting
+    // entropy" at its next PRNG reseed.
+    CONTROL_OP_GET_ENTROPY_FOR_XNU_PRNG = 54,
 };
 
 enum {
@@ -388,6 +392,15 @@ static void apple_sep_sim_handle_control_msg(AppleSEPSimState *s,
         qemu_log_mask(LOG_GUEST_ERROR, "EP_CONTROL: SELF_TEST\n");
         apple_sep_sim_control_send_ack(s, msg, 0, 0);
         break;
+    case CONTROL_OP_GET_ENTROPY_FOR_XNU_PRNG: {
+        uint32_t entropy;
+
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "EP_CONTROL: GET_ENTROPY_FOR_XNU_PRNG\n");
+        qemu_guest_getrandom_nofail(&entropy, sizeof(entropy));
+        apple_sep_sim_control_send_ack(s, msg, 0, entropy);
+        break;
+    }
     case CONTROL_OP_ERASE_INSTALL: {
         qemu_log_mask(LOG_GUEST_ERROR, "EP_CONTROL: ERASE_INSTALL\n");
         apple_sep_sim_control_send_ack(s, msg, 0, 0);
@@ -648,6 +661,41 @@ static uint8_t *apple_sep_sim_gen_sks_hash(uint8_t *buf,
     assert_nonnull(hash);
     assert_cmpuint(hash_len, ==, 32);
     return hash;
+}
+
+/* keybag_state bits as reported in the device-state "ss" key. */
+#define SKS_KEYBAG_STATE_NO_PIN BIT(1)
+#define SKS_KEYBAG_STATE_BEEN_UNLOCKED BIT(2)
+
+/*
+ * Append SEQUENCE { UTF8String key, INTEGER value } (short-form lengths,
+ * minimal two's complement) and return the number of bytes written.
+ */
+static size_t sks_der_put_int(uint8_t *out, const char *key, int64_t value)
+{
+    const size_t key_len = strlen(key);
+    uint8_t be[8];
+    size_t int_len = 8;
+
+    for (int i = 7; i >= 0; i--) {
+        be[i] = value & 0xFF;
+        value >>= 8;
+    }
+    while (int_len > 1 &&
+           ((be[8 - int_len] == 0x00 && !(be[9 - int_len] & 0x80)) ||
+            (be[8 - int_len] == 0xFF && (be[9 - int_len] & 0x80)))) {
+        int_len--;
+    }
+
+    out[0] = 0x30;
+    out[1] = 2 + key_len + 2 + int_len;
+    out[2] = 0x0C;
+    out[3] = key_len;
+    memcpy(out + 4, key, key_len);
+    out[4 + key_len] = 0x02;
+    out[5 + key_len] = int_len;
+    memcpy(out + 6 + key_len, be + 8 - int_len, int_len);
+    return 6 + key_len + int_len;
 }
 
 static void apple_sep_sim_keystore_send_ipc_resp(AppleSEPSimState *s,
@@ -917,16 +965,43 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         break;
     }
     case 0x19: {
+        /*
+         * Get Device State (aks_get_device_state / _extended_, userclient
+         * selectors 0x11 / 0x23). The reply blob is decoded by
+         * AppleKeyStore.framework `_decode_extended_state`: a DER SET of
+         * SEQUENCE { UTF8String key, value }; missing keys decode as 0.
+         * A non-DER blob therefore reads as "passcode set, never unlocked
+         * since boot", and first-unlock waiters poll forever. Report the
+         * truth of a simulated SEP with no passcode: unlocked, no pin, been
+         * unlocked since boot.
+         */
         uint32_t *word0 = (uint32_t *)(msg_hdr + 1);
         uint64_t *lword = (uint64_t *)(word0 + 1);
         uint32_t *word1 = (uint32_t *)(lword + 1);
         uint32_t *word2 = (uint32_t *)(word1 + 1);
+        const int32_t handle = (int32_t)(uint32_t)*lword;
         qemu_log_mask(LOG_GUEST_ERROR,
                       "SEP KeyStore // Get Device State 0x%X 0x%" PRIx64
                       " 0x%X 0x%X\n",
                       *word0, *lword, *word1, *word2);
 
-        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + 0x8;
+        uint8_t dict[128];
+        size_t len = 2;
+        len += sks_der_put_int(dict + len, "ss", SKS_KEYBAG_STATE_NO_PIN |
+                                                 SKS_KEYBAG_STATE_BEEN_UNLOCKED);
+        len += sks_der_put_int(dict + len, "sls", 0);
+        len += sks_der_put_int(dict + len, "bh", handle);
+        len += sks_der_put_int(dict + len, "mua", 10);
+        g_assert(len - 2 < 0x80);
+        dict[0] = 0x31;
+        dict[1] = len - 2;
+
+        /*
+         * The kext deserialises an output blob as u32 length + data padded
+         * to 4 bytes, and rejects the reply if the padding is missing.
+         */
+        const uint32_t resp_size =
+            KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + ROUND_UP(len, 4);
         uint8_t *resp_buf = g_new0(uint8_t, resp_size);
 
         KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
@@ -939,13 +1014,56 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
                sizeof(resp_hdr->ipc_digest));
 
-        // Again, guessing.
-        uint32_t *selector = (uint32_t *)(resp_hdr + 1);
-        *selector = 0;
-        // FIXME: This is a DER! See `_decode_extended_state`.
-        uint32_t *state_blob = selector + 1;
-        *state_blob = 0x8;
-        memcpy(state_blob + 1, "applehax", *state_blob);
+        uint32_t *status = (uint32_t *)(resp_hdr + 1);
+        *status = 0;
+        uint32_t *blob_len = status + 1;
+        *blob_len = len;
+        memcpy(blob_len + 1, dict, len);
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
+    case 0x23: {
+        /*
+         * Get Configuration (aks_get_configuration, userclient selector 31).
+         * The client decodes the output blob with the same DER dictionary
+         * format as Get Device State (keys gp, bd, mua, cf, ...) into a
+         * CFDictionary; without a blob the call fails with 0xe00002bc and
+         * MobileKeyBag cannot answer lock/passcode questions. Report the
+         * configuration of a device with no passcode.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Get Configuration\n");
+
+        uint8_t dict[64];
+        size_t len = 2;
+        len += sks_der_put_int(dict + len, "gp", 0);
+        len += sks_der_put_int(dict + len, "mua", 10);
+        len += sks_der_put_int(dict + len, "cf", 0);
+        g_assert(len - 2 < 0x80);
+        dict[0] = 0x31;
+        dict[1] = len - 2;
+
+        /* blob = u32 length + data padded to 4 bytes (see Get Device State) */
+        const uint32_t resp_size =
+            KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + ROUND_UP(len, 4);
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        uint32_t *status = (uint32_t *)(resp_hdr + 1);
+        *status = 0;
+        uint32_t *blob_len = status + 1;
+        *blob_len = len;
+        memcpy(blob_len + 1, dict, len);
 
         apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
         g_free(resp_buf);
@@ -976,15 +1094,116 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         g_free(resp_buf);
         break;
     }
-    default: {
-        qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Unknown (0x%02X)\n",
-                      msg_code);
+    case 0x51: {
+        /*
+         * iOS 26 AKSIdentitySetPrimary (restore, create_protected_filesystems).
+         * The kext wraps the reply's output blob in an OSData and copies it to
+         * the caller, so an empty output fails with 0xe00002bc. Reply: status
+         * 0, blob length 2, blob = empty DER set (31 00); same layout as
+         * Copy Keybag (status, length, bytes).
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // Identity Set Primary\n");
 
-        dma_memory_write(s->dma_as, s->ool_state[EP_KEYSTORE].out_addr, msg_buf,
-                         msg->size, MEMTXATTRS_UNSPECIFIED);
-        apple_sep_sim_send_message(s, msg->ep,
-                                   msg->tag | KEYSTORE_MSG_TAG_REPLY, msg->id,
-                                   0, (uint32_t)msg->size << 16);
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        uint32_t *selector = (uint32_t *)(resp_hdr + 1);
+        *selector = 0;
+        uint32_t *blob_len = selector + 1;
+        *blob_len = 2;
+        uint8_t *blob = (uint8_t *)(blob_len + 1);
+        blob[0] = 0x31;
+        blob[1] = 0x00;
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
+    case 0x0B: {
+        /*
+         * iOS 26: 0x0B creates the effaceable D key. Reply with the status
+         * word only, like the other no-output requests (Unload Keybag,
+         * Null D Key).
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // 0x%02X (status-only reply)\n", msg_code);
+
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
+    default: {
+        /*
+         * Unhandled request: reply status 0 followed by an output blob that
+         * holds an empty DER set (31 00), length-prefixed and padded to 4
+         * bytes, the same layout as Identity Set Primary (0x51). The kext's
+         * reply deserializer reads a u32 length after the status, so echoing
+         * the request body (the old default) handed it the request's own
+         * words as a blob length and the call failed with 0xe00002bc
+         * (iOS 26 second boot: aks_set_configuration sel 30,
+         * aks_get_internal_info_for_key 93, aks_memento_get_state 139,
+         * aks_get_internal_state 142). Getters that wrap the output in an
+         * OSData need a non-empty blob; an empty DER dict decodes as "all
+         * keys missing" (= 0).
+         */
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        uint32_t req_word0 = 0;
+
+        if (msg->size >= KEYSTORE_IPC_HEADER_SIZE + 4) {
+            memcpy(&req_word0, msg_buf + KEYSTORE_IPC_HEADER_SIZE,
+                   sizeof(req_word0));
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // Unknown (0x%02X) size 0x%X"
+                      " version %u flags 0x%X word0 0x%X"
+                      " -> status 0, empty DER set\n",
+                      msg_code, msg->size, msg_hdr->ipc_version,
+                      msg_hdr->flags, req_word0);
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        uint32_t *status = (uint32_t *)(resp_hdr + 1);
+        *status = 0;
+        uint32_t *blob_len = status + 1;
+        *blob_len = 2;
+        uint8_t *blob = (uint8_t *)(blob_len + 1);
+        blob[0] = 0x31;
+        blob[1] = 0x00;
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
         break;
     }
     }
@@ -1015,11 +1234,63 @@ static void apple_sep_sim_handle_messages(void *opaque)
             qemu_log_mask(LOG_GUEST_ERROR,
                           "EP_ART_REQUESTS: Unknown opcode %d\n", sep_msg->op);
             break;
-        case EP_SECURE_CREDENTIALS:
+        case EP_SECURE_CREDENTIALS: {
+            uint8_t dump[96];
+            GString *hex = g_string_new(NULL);
+            dma_memory_read(s->dma_as,
+                            s->ool_state[EP_SECURE_CREDENTIALS].in_addr, dump,
+                            sizeof(dump), MEMTXATTRS_UNSPECIFIED);
+            for (size_t i = 0; i < sizeof(dump); i++) {
+                g_string_append_printf(hex, "%02x", dump[i]);
+            }
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "EP_SECURE_CREDENTIALS: Unknown opcode %d\n",
-                          sep_msg->op);
+                          "SCRD raw ep=%u tag=0x%02x op=0x%02x param=0x%02x "
+                          "data=0x%08x in_addr=0x%" PRIx64 " ool=%s\n",
+                          sep_msg->ep, sep_msg->tag, sep_msg->op,
+                          sep_msg->param, sep_msg->data,
+                          (uint64_t)s->ool_state[EP_SECURE_CREDENTIALS].in_addr,
+                          hex->str);
+            g_string_free(hex, true);
+            /*
+             * AppleSEPCredentialManager handleSEPMessage: reply word = ep
+             * (byte 0), request (byte 1), payload length in the OOL out buffer
+             * (bits 16-31), info (bits 32-63; non-zero = "SEP returned
+             * error"). Without a reply every ACM sendSEPCommand waits its
+             * full 5 s timeout. Fail fast instead: no payload, info 1.
+             */
+            if (sep_msg->tag == 4) {
+                /*
+                 * ACM command (request 4). sendSEPCommand validates the reply
+                 * as SCRDResponsePayload_v1: u8 version (non-zero), u8, u16
+                 * header size, u32 response id (must equal the request id at
+                 * offset 4 of the request), u32; anything after the header is
+                 * copied out as the command result. Answer success with an
+                 * empty result.
+                 */
+                uint8_t resp[12] = { 0 };
+                uint32_t req_id;
+
+                memcpy(&req_id, dump + 4, sizeof(req_id));
+                resp[0] = 1;
+                stw_le_p(resp + 2, sizeof(resp));
+                stl_le_p(resp + 4, req_id);
+                dma_memory_write(s->dma_as,
+                                 s->ool_state[EP_SECURE_CREDENTIALS].out_addr,
+                                 resp, sizeof(resp), MEMTXATTRS_UNSPECIFIED);
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "SCRD reply request 4 id %u -> ok, empty result\n",
+                              req_id);
+                /* length in bits 16-31 (op = low byte, param = high byte) */
+                apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag,
+                                           sizeof(resp) & 0xFF,
+                                           sizeof(resp) >> 8, 0);
+                break;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR, "SCRD reply request %u -> error\n",
+                          sep_msg->tag);
+            apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag, 0, 0, 1);
             break;
+        }
         case EP_XART_SLAVE:
             apple_sep_sim_handle_xart_msg(s, true, sep_msg);
             break;
