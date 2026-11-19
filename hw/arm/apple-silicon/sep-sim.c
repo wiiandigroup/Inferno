@@ -663,6 +663,41 @@ static uint8_t *apple_sep_sim_gen_sks_hash(uint8_t *buf,
     return hash;
 }
 
+/* keybag_state bits as reported in the device-state "ss" key. */
+#define SKS_KEYBAG_STATE_NO_PIN BIT(1)
+#define SKS_KEYBAG_STATE_BEEN_UNLOCKED BIT(2)
+
+/*
+ * Append SEQUENCE { UTF8String key, INTEGER value } (short-form lengths,
+ * minimal two's complement) and return the number of bytes written.
+ */
+static size_t sks_der_put_int(uint8_t *out, const char *key, int64_t value)
+{
+    const size_t key_len = strlen(key);
+    uint8_t be[8];
+    size_t int_len = 8;
+
+    for (int i = 7; i >= 0; i--) {
+        be[i] = value & 0xFF;
+        value >>= 8;
+    }
+    while (int_len > 1 &&
+           ((be[8 - int_len] == 0x00 && !(be[9 - int_len] & 0x80)) ||
+            (be[8 - int_len] == 0xFF && (be[9 - int_len] & 0x80)))) {
+        int_len--;
+    }
+
+    out[0] = 0x30;
+    out[1] = 2 + key_len + 2 + int_len;
+    out[2] = 0x0C;
+    out[3] = key_len;
+    memcpy(out + 4, key, key_len);
+    out[4 + key_len] = 0x02;
+    out[5 + key_len] = int_len;
+    memcpy(out + 6 + key_len, be + 8 - int_len, int_len);
+    return 6 + key_len + int_len;
+}
+
 static void apple_sep_sim_keystore_send_ipc_resp(AppleSEPSimState *s,
                                                  const KeystoreMessage *msg,
                                                  uint8_t *resp_buf,
@@ -930,16 +965,43 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         break;
     }
     case 0x19: {
+        /*
+         * Get Device State (aks_get_device_state / _extended_, userclient
+         * selectors 0x11 / 0x23). The reply blob is decoded by
+         * AppleKeyStore.framework `_decode_extended_state`: a DER SET of
+         * SEQUENCE { UTF8String key, value }; missing keys decode as 0.
+         * A non-DER blob therefore reads as "passcode set, never unlocked
+         * since boot", and first-unlock waiters poll forever. Report the
+         * truth of a simulated SEP with no passcode: unlocked, no pin, been
+         * unlocked since boot.
+         */
         uint32_t *word0 = (uint32_t *)(msg_hdr + 1);
         uint64_t *lword = (uint64_t *)(word0 + 1);
         uint32_t *word1 = (uint32_t *)(lword + 1);
         uint32_t *word2 = (uint32_t *)(word1 + 1);
+        const int32_t handle = (int32_t)(uint32_t)*lword;
         qemu_log_mask(LOG_GUEST_ERROR,
                       "SEP KeyStore // Get Device State 0x%X 0x%" PRIx64
                       " 0x%X 0x%X\n",
                       *word0, *lword, *word1, *word2);
 
-        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + 0x8;
+        uint8_t dict[128];
+        size_t len = 2;
+        len += sks_der_put_int(dict + len, "ss", SKS_KEYBAG_STATE_NO_PIN |
+                                                 SKS_KEYBAG_STATE_BEEN_UNLOCKED);
+        len += sks_der_put_int(dict + len, "sls", 0);
+        len += sks_der_put_int(dict + len, "bh", handle);
+        len += sks_der_put_int(dict + len, "mua", 10);
+        g_assert(len - 2 < 0x80);
+        dict[0] = 0x31;
+        dict[1] = len - 2;
+
+        /*
+         * The kext deserialises an output blob as u32 length + data padded
+         * to 4 bytes, and rejects the reply if the padding is missing.
+         */
+        const uint32_t resp_size =
+            KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + ROUND_UP(len, 4);
         uint8_t *resp_buf = g_new0(uint8_t, resp_size);
 
         KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
@@ -952,13 +1014,11 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
                sizeof(resp_hdr->ipc_digest));
 
-        // Again, guessing.
-        uint32_t *selector = (uint32_t *)(resp_hdr + 1);
-        *selector = 0;
-        // FIXME: This is a DER! See `_decode_extended_state`.
-        uint32_t *state_blob = selector + 1;
-        *state_blob = 0x8;
-        memcpy(state_blob + 1, "applehax", *state_blob);
+        uint32_t *status = (uint32_t *)(resp_hdr + 1);
+        *status = 0;
+        uint32_t *blob_len = status + 1;
+        *blob_len = len;
+        memcpy(blob_len + 1, dict, len);
 
         apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
         g_free(resp_buf);
