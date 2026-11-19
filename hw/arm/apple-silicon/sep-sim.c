@@ -1254,6 +1254,34 @@ static void apple_sep_sim_handle_messages(void *opaque)
              * error"). Without a reply every ACM sendSEPCommand waits its
              * full 5 s timeout. Fail fast instead: no payload, info 1.
              */
+            if (sep_msg->tag == 4) {
+                /*
+                 * ACM command (request 4). sendSEPCommand validates the reply
+                 * as SCRDResponsePayload_v1: u8 version (non-zero), u8, u16
+                 * header size, u32 response id (must equal the request id at
+                 * offset 4 of the request), u32; anything after the header is
+                 * copied out as the command result. Answer success with an
+                 * empty result.
+                 */
+                uint8_t resp[12] = { 0 };
+                uint32_t req_id;
+
+                memcpy(&req_id, dump + 4, sizeof(req_id));
+                resp[0] = 1;
+                stw_le_p(resp + 2, sizeof(resp));
+                stl_le_p(resp + 4, req_id);
+                dma_memory_write(s->dma_as,
+                                 s->ool_state[EP_SECURE_CREDENTIALS].out_addr,
+                                 resp, sizeof(resp), MEMTXATTRS_UNSPECIFIED);
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "SCRD reply request 4 id %u -> ok, empty result\n",
+                              req_id);
+                /* length in bits 16-31 (op = low byte, param = high byte) */
+                apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag,
+                                           sizeof(resp) & 0xFF,
+                                           sizeof(resp) >> 8, 0);
+                break;
+            }
             qemu_log_mask(LOG_GUEST_ERROR, "SCRD reply request %u -> error\n",
                           sep_msg->tag);
             apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag, 0, 0, 1);
