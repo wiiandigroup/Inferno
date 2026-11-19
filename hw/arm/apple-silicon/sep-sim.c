@@ -1024,6 +1024,51 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         g_free(resp_buf);
         break;
     }
+    case 0x23: {
+        /*
+         * Get Configuration (aks_get_configuration, userclient selector 31).
+         * The client decodes the output blob with the same DER dictionary
+         * format as Get Device State (keys gp, bd, mua, cf, ...) into a
+         * CFDictionary; without a blob the call fails with 0xe00002bc and
+         * MobileKeyBag cannot answer lock/passcode questions. Report the
+         * configuration of a device with no passcode.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Get Configuration\n");
+
+        uint8_t dict[64];
+        size_t len = 2;
+        len += sks_der_put_int(dict + len, "gp", 0);
+        len += sks_der_put_int(dict + len, "mua", 10);
+        len += sks_der_put_int(dict + len, "cf", 0);
+        g_assert(len - 2 < 0x80);
+        dict[0] = 0x31;
+        dict[1] = len - 2;
+
+        /* blob = u32 length + data padded to 4 bytes (see Get Device State) */
+        const uint32_t resp_size =
+            KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4 + ROUND_UP(len, 4);
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->ipc_version = KEYSTORE_IPC_VERSION_1;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        uint32_t *status = (uint32_t *)(resp_hdr + 1);
+        *status = 0;
+        uint32_t *blob_len = status + 1;
+        *blob_len = len;
+        memcpy(blob_len + 1, dict, len);
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
     case 0x1B: {
         const uint32_t *selector = (uint32_t *)(msg_hdr + 1);
         qemu_log_mask(LOG_GUEST_ERROR,
