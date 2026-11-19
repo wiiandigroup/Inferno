@@ -20,8 +20,22 @@ as their `Co-Authored-By` lines show.
 | Build without `ENABLE_DATA_ENCRYPTION` | Lets the machine start with a simulated SEP, without a dumped SEP ROM. This turns iOS data protection off in every configuration, also with real SEP emulation. |
 | Touch controller (`mt-spi`): 30-byte path record (contact density, pitch, force, flags), edge flag, velocity in units per second clamped to INT16_MAX, 60 Hz reports, reports sent in order | The old 20-byte record and zero velocity were not enough for iOS to treat a drag as a gesture; queued reports could reach iOS in reverse order. Layout follows [MakrSas/Inferno](https://github.com/MakrSas/Inferno). Taps reach iOS 14; swipe to unlock is still being worked on. |
 
+| Accept iOS 27 build versions | Lets the machine load iOS 27 images (they still do not boot, see below). |
+| Kernel patch: allow an unencrypted Data volume | Without `ENABLE_DATA_ENCRYPTION`, restore creates the Data volume unencrypted, and iOS 26 APFS panics "unencrypted data volume is not allowed" when mounting it. |
+| Simulated SEP: answer XNU's PRNG entropy request | iOS 26 asks the SEP for entropy at boot and waited forever without a reply. |
+| Simulated SEP keystore: Get Device State (`0x19`) and Get Configuration (`0x23`) reply with a DER dictionary, padded to 4 bytes | Without a real reply the first boot looped on "Get Device State" forever, and an unpadded blob made the kernel driver reject the call (`0xe00002bc`). |
+| Simulated SEP keystore: unhandled requests reply status 0 + an empty DER set | The old default echoed the request, which the driver read as an output-blob length, so several getters failed. |
+| Simulated SEP credentials (ACM, `scrd`): command requests get a well-formed success reply; the init request gets an error | Without replies every ACM command waited a 5 s timeout. |
+
 Tested with iOS 14.0 beta 5 (`18A5351d`): restore with real SEP emulation, first boot and USB pairing work. iOS 26.6.2
-(`23G90`) restore is in progress. iOS 27 does not boot: it needs SPTM and TXM, which Inferno does not emulate.
+(`23G90`): restore completes, first boot runs data migration, and the second boot reaches the end of the progress bar;
+Setup Assistant is not reached yet. iOS 27 does not boot: it needs SPTM and TXM, which Inferno does not emulate.
+
+Known keystore failures left as they are (each happens once per boot):
+- `aks_assert_consume` (selector 101) returns `0xe00002e2`: the kernel driver refuses it itself because no global
+  assertion is held, which is normal outside a restore or update. The request never reaches the SEP.
+- `aks_stash_load` (selector 34) returns `0xe00002bc`: no update stash exists because no software update was run. A real
+  device should fail this call on a normal boot too, but that is not confirmed.
 
 > [!CAUTION]
 > Please consider donating/tipping to help continue the project's development,
