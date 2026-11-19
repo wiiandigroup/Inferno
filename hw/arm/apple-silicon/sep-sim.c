@@ -1185,11 +1185,35 @@ static void apple_sep_sim_handle_messages(void *opaque)
             qemu_log_mask(LOG_GUEST_ERROR,
                           "EP_ART_REQUESTS: Unknown opcode %d\n", sep_msg->op);
             break;
-        case EP_SECURE_CREDENTIALS:
+        case EP_SECURE_CREDENTIALS: {
+            uint8_t dump[96];
+            GString *hex = g_string_new(NULL);
+            dma_memory_read(s->dma_as,
+                            s->ool_state[EP_SECURE_CREDENTIALS].in_addr, dump,
+                            sizeof(dump), MEMTXATTRS_UNSPECIFIED);
+            for (size_t i = 0; i < sizeof(dump); i++) {
+                g_string_append_printf(hex, "%02x", dump[i]);
+            }
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "EP_SECURE_CREDENTIALS: Unknown opcode %d\n",
-                          sep_msg->op);
+                          "SCRD raw ep=%u tag=0x%02x op=0x%02x param=0x%02x "
+                          "data=0x%08x in_addr=0x%" PRIx64 " ool=%s\n",
+                          sep_msg->ep, sep_msg->tag, sep_msg->op,
+                          sep_msg->param, sep_msg->data,
+                          (uint64_t)s->ool_state[EP_SECURE_CREDENTIALS].in_addr,
+                          hex->str);
+            g_string_free(hex, true);
+            /*
+             * AppleSEPCredentialManager handleSEPMessage: reply word = ep
+             * (byte 0), request (byte 1), payload length in the OOL out buffer
+             * (bits 16-31), info (bits 32-63; non-zero = "SEP returned
+             * error"). Without a reply every ACM sendSEPCommand waits its
+             * full 5 s timeout. Fail fast instead: no payload, info 1.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR, "SCRD reply request %u -> error\n",
+                          sep_msg->tag);
+            apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag, 0, 0, 1);
             break;
+        }
         case EP_XART_SLAVE:
             apple_sep_sim_handle_xart_msg(s, true, sep_msg);
             break;
