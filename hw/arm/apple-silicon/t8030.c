@@ -2830,6 +2830,7 @@ static void t8030_init(MachineState *machine)
     case 17:
     case 18:
     case 26:
+    case 27: // MinForening nomac: iOS 27 (iPhone 11 gets 27.x); assumed unchanged from 26.
         t8030->sio_protocol = 10;
         break;
     default:
